@@ -1,0 +1,193 @@
+name: Perf A/B APK (Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline source repo ref (branch/tag/commit)
+        required: true
+        default: main
+      head_ref:
+        description: Candidate source repo ref (branch/tag/commit)
+        required: true
+        default: main
+      runUiTests:
+        description: Run emulator UI smoke tests (optional, slow)
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (build repo)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Checkout private source via SSH deploy key
+        shell: bash
+        env:
+          SOURCE_REPO_SSH_KEY: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_REPO_SSH_KEY}" ]; then
+            echo "Missing SOURCE_REPO_SSH_KEY secret"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          echo "${SOURCE_REPO_SSH_KEY}" > ~/.ssh/source_repo
+          chmod 600 ~/.ssh/source_repo
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts
+
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/source_repo -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes'
+          git clone git@github.com:FuChuZhao/ai-inbox-bridge.git source
+          cd source
+          git fetch --all --tags --prune
+          git rev-parse HEAD
+
+      - name: Resolve base/head refs
+        shell: bash
+        working-directory: source
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          resolve_ref() {
+            local ref="$1"
+            if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+              git rev-parse "${ref}^{commit}"
+              return 0
+            fi
+            if git rev-parse --verify --quiet "origin/${ref}^{commit}" >/dev/null; then
+              git rev-parse "origin/${ref}^{commit}"
+              return 0
+            fi
+            if git rev-parse --verify --quiet "refs/tags/${ref}^{commit}" >/dev/null; then
+              git rev-parse "refs/tags/${ref}^{commit}"
+              return 0
+            fi
+
+            # Last resort: try fetching the ref/sha directly.
+            git fetch --no-tags origin "${ref}" >/dev/null 2>&1 || true
+            if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+              git rev-parse "${ref}^{commit}"
+              return 0
+            fi
+
+            echo "Unable to resolve ref: ${ref}" >&2
+            echo "Known refs (first 80):" >&2
+            git show-ref --heads --tags | sed -n '1,80p' >&2 || true
+            exit 2
+          }
+
+          BASE_COMMIT="$(resolve_ref "${BASE_REF}")"
+          HEAD_COMMIT="$(resolve_ref "${HEAD_REF}")"
+
+          echo "BASE_COMMIT=${BASE_COMMIT}" >> "${GITHUB_ENV}"
+          echo "HEAD_COMMIT=${HEAD_COMMIT}" >> "${GITHUB_ENV}"
+          echo "Resolved:"
+          echo "base_ref=${BASE_REF} -> ${BASE_COMMIT}"
+          echo "head_ref=${HEAD_REF} -> ${HEAD_COMMIT}"
+
+      - name: Run UI smoke tests (optional, head ref)
+        if: inputs.runUiTests == 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          disable-animations: true
+          working-directory: source
+          script: |
+            set -euo pipefail
+            git checkout --detach "${HEAD_COMMIT}"
+            chmod +x ./gradlew
+            ./gradlew :app:connectedDebugAndroidTest
+
+      - name: Decode signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64}" ]; then
+            echo "Missing ANDROID_KEYSTORE_BASE64 secret"
+            exit 1
+          fi
+          echo "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "${GITHUB_WORKSPACE}/ci-signing.jks"
+
+      - name: Build base/head Release APKs
+        shell: bash
+        working-directory: source
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-signing.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p _work "${GITHUB_WORKSPACE}/dist"
+
+          git worktree add _work/base "${BASE_COMMIT}"
+          git worktree add _work/head "${HEAD_COMMIT}"
+
+          build_one() {
+            local label="$1"
+            local dir="$2"
+            echo "== build ${label} =="
+            pushd "${dir}" >/dev/null
+            chmod +x ./gradlew
+            ./gradlew :app:assembleRelease
+            popd >/dev/null
+
+            local apk="${dir}/app/build/outputs/apk/release/app-release.apk"
+            if [ ! -f "${apk}" ]; then
+              echo "Missing APK: ${apk}"
+              exit 2
+            fi
+
+            cp -f "${apk}" "${GITHUB_WORKSPACE}/dist/${label}.apk"
+          }
+
+          build_one base _work/base
+          build_one head _work/head
+
+          BASE_SHA="$(git -C _work/base rev-parse HEAD)"
+          HEAD_SHA="$(git -C _work/head rev-parse HEAD)"
+
+          cat > "${GITHUB_WORKSPACE}/dist/meta.json" <<EOF
+          {
+            "source_repo": "FuChuZhao/ai-inbox-bridge",
+            "base_ref": "${BASE_REF}",
+            "base_sha": "${BASE_SHA}",
+            "head_ref": "${HEAD_REF}",
+            "head_sha": "${HEAD_SHA}",
+            "built_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          echo "dist:"
+          ls -la "${GITHUB_WORKSPACE}/dist"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-ab-apks
+          path: dist
+          retention-days: 1
